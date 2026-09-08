@@ -1,0 +1,61 @@
+# Cluster for the reduction_engine optimization loop: one LLM worker and one
+# toolchain worker on the same machine.
+#
+# The split matters. The LLM worker is not containerized, so it reads Application
+# Default Credentials straight from ~/.config/gcloud and needs no credential
+# mounting. The toolchain worker is containerized because it needs verilator,
+# cocotb, sv2v, and yosys. An LLM call and a simulator have no reason to share
+# an image.
+#
+# The repo is bind-mounted at its own host path rather than at /repo, so a
+# workdir path is the same string inside and outside the container -- the loop
+# hands the same absolute path to a host-side tool and a container-side node.
+#
+# Before `chia up`:
+#   export THIS_MACHINE=$(hostname -I | awk '{print $1}')
+#   export GOOGLE_CLOUD_PROJECT=<project id>
+
+provider:
+    head_ip: ${THIS_MACHINE}
+
+auth:
+    ssh_user: ${USER}
+
+available_node_types:
+    vertex_worker:
+        # VertexGeminiLLM.prompt asks for vertex_creds: 0.01, so one unit allows
+        # 100 concurrent prompts; real concurrency is bounded by Vertex quota.
+        # The RtlEditTool actor also lands here, which is what lets it write to
+        # the workdir on the host filesystem.
+        resources: {"vertex_creds": 1}
+        num_workers: 1
+        compatible_ips: ["${THIS_MACHINE}"]
+        worker_env_commands:
+            - "source ~/miniconda3/etc/profile.d/conda.sh && conda activate chia_env && export GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}"
+
+    cocotb_worker:
+        # One at a time: the loop evaluates a single candidate per attempt, and
+        # concurrent verilator builds would only contend for this machine's RAM.
+        resources: {"cocotb_run": 1}
+        num_workers: 1
+        compatible_ips: ["${THIS_MACHINE}"]
+        docker:
+            image: "spec2inc-cocotb-verilator:latest"
+            container_name: "chia-agentopt-${USER}"
+            pull_before_run: false
+            run_options:
+                - -v /home/roman/spec2inc:/home/roman/spec2inc
+                - --ulimit nofile=65536:65536
+                - --shm-size=4gb
+
+head_env_commands: ["source ~/miniconda3/etc/profile.d/conda.sh && conda activate chia_env"]
+head_setup_commands: ["source ~/miniconda3/etc/profile.d/conda.sh && conda activate chia_env"]
+head_start_ray_commands:
+    - "source ~/miniconda3/etc/profile.d/conda.sh && conda activate chia_env && ray stop"
+    - "source ~/miniconda3/etc/profile.d/conda.sh && conda activate chia_env && \
+        ray start --head --port=6379 \
+        --include-dashboard=True --dashboard-agent-listen-port=0"
+
+worker_start_ray_commands:
+    - "ray stop"
+    - "ray start --address=$RAY_HEAD_IP:6379 --dashboard-agent-listen-port=0"
