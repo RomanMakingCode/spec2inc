@@ -132,8 +132,8 @@ arbiter; `RED_SHARED=0` instantiates one per client instead.
 | `clk`, `rst_n` | in | `logic` | |
 | `op_valid` | in | `logic` | Operand set presented |
 | `op_ready` | out | `logic` | |
-| `op_mask` | in | `logic [MAX_PORTS-1:0]` | Which operand slots are populated |
-| `op_data` | in | `logic [MAX_PORTS-1:0][DATA_W-1:0]` | Operand beats |
+| `op_mask` | in | `logic [N_PORTS-1:0]` | Which operand slots are populated |
+| `op_data` | in | `logic [N_PORTS*DATA_W-1:0]` | Operand beats, operand *p* at `[p*DATA_W +: DATA_W]` |
 | `op_id` | in | `logic [TAG_W-1:0]` | Opaque, returned with the result |
 | `res_valid` | out | `logic` | |
 | `res_ready` | in | `logic` | |
@@ -153,6 +153,11 @@ arbiter; `RED_SHARED=0` instantiates one per client instead.
 
 **Oracle:** pure function. Randomized operand sets checked against a Python sum. No collective
 semantics involved.
+
+Sized by `N_PORTS` rather than `MAX_PORTS`: this engine only ever sees its own instance's
+operands, so a fixed 64-slot port would carry dead bits at every smaller radix. Callers holding
+a `port_mask_t` slice it down. `op_data` is flat rather than a packed 2-D array so its layout is
+unambiguous to verilator, sv2v, and the cocotb testbench alike.
 
 ---
 
