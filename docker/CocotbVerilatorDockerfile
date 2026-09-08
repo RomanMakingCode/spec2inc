@@ -1,0 +1,30 @@
+# Lean worker image for standalone Verilog/SystemVerilog RTL verification
+# via cocotb + Verilator. Unlike CHIA's chia-chisel-build/chia-verilator-run
+# images, this does not clone or build Chipyard — spec2inc's UALink-inspired
+# fabric is a standalone module tested via its own cocotb testbench, not a
+# full RISC-V SoC, so the Chipyard build chain (many GB, ~2hr) is unneeded.
+#
+# Build (from the spec2inc repo root):
+#
+#   docker build -f docker/CocotbVerilatorDockerfile -t spec2inc-cocotb-verilator:latest .
+#
+FROM ghcr.io/ucb-bar/chia:latest
+
+USER root
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+USER ray
+ENV HOME=/home/ray
+WORKDIR /home/ray
+
+# Ubuntu 22.04's apt verilator is 4.038, but cocotb 2.x requires >=5.036.
+# conda-forge has current releases; the base image already has conda.
+RUN conda install -y -c conda-forge "verilator>=5.036" \
+    && conda clean -afy
+
+RUN pip install --no-cache-dir cocotb cocotb-test
+
+WORKDIR /home/ray

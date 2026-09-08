@@ -1,0 +1,43 @@
+# Single-machine CHIA cluster: head + local cocotb/Verilator worker, both
+# on this PC. No tailnet/gcp_nodes - spec2inc's compute budget doesn't
+# include GCP burst workers unless/until this PC becomes a bottleneck.
+#
+# Before `chia up`:
+#   export THIS_MACHINE=$(hostname -I | cut -d' ' -f1)
+
+provider:
+    head_ip: ${THIS_MACHINE}
+
+auth:
+    ssh_user: ${USER}
+
+available_node_types:
+    cocotb_worker:
+        # Cap at 4 concurrent cocotb_run tasks: EDA sims are memory-hungry
+        # and this machine has 16GB RAM (12C/24T CPU has far more headroom
+        # than RAM does for concurrent Verilator processes).
+        resources: {"cocotb_run": 4}
+        num_workers: 1
+        compatible_ips: ["${THIS_MACHINE}"]
+        docker:
+            image: "spec2inc-cocotb-verilator:latest"
+            container_name: "chia-cocotb-${USER}"
+            pull_before_run: false  # locally built, not in any registry
+            run_options:
+                # CHIA adds no volume mounts itself - bind-mount the repo so
+                # the worker's Ray process can import our node classes and
+                # the container can see the cocotb test sources.
+                - -v /home/roman/spec2inc:/home/roman/spec2inc
+                - -e PYTHONPATH=/home/roman/spec2inc/examples/smoke_test
+
+head_env_commands: ["source ~/miniconda3/etc/profile.d/conda.sh && conda activate chia_env"]
+head_setup_commands: ["source ~/miniconda3/etc/profile.d/conda.sh && conda activate chia_env"]
+head_start_ray_commands:
+    - "source ~/miniconda3/etc/profile.d/conda.sh && conda activate chia_env && ray stop"
+    - "source ~/miniconda3/etc/profile.d/conda.sh && conda activate chia_env && \
+        ray start --head --port=6379 \
+        --include-dashboard=True --dashboard-agent-listen-port=0"
+
+worker_start_ray_commands:
+    - "ray stop"
+    - "ray start --address=$RAY_HEAD_IP:6379 --dashboard-agent-listen-port=0"
