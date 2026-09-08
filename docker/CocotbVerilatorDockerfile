@@ -16,6 +16,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+# sv2v converts SystemVerilog to Verilog-2005 ahead of the yosys elaboration
+# gate. Yosys's native SV frontend rejects typedef'd port types, unpacked struct
+# arrays, package imports in module headers, and $bits(type) -- all synthesizable
+# constructs that commercial tools accept. Converting first keeps the RTL
+# readable instead of contorting the design around a parser limitation.
+#
+# The binary is vendored into the build context by docker/fetch-sv2v.sh rather
+# than downloaded here: docker build on the WSL2 host cannot complete a TLS
+# transfer to github (curl 28), though the same fetch works from the host shell
+# and from running containers. Run that script before building.
+COPY docker/vendor/sv2v /usr/local/bin/sv2v
+RUN chmod 0755 /usr/local/bin/sv2v && sv2v --version
+
 USER ray
 ENV HOME=/home/ray
 WORKDIR /home/ray
