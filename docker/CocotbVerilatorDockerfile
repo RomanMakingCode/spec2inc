@@ -21,8 +21,11 @@ ENV HOME=/home/ray
 WORKDIR /home/ray
 
 # Ubuntu 22.04's apt verilator is 4.038, but cocotb 2.x requires >=5.036.
-# conda-forge has current releases; the base image already has conda.
-RUN conda install -y -c conda-forge "verilator>=5.036" \
+# apt's yosys is 0.9 (2019), which predates usable SystemVerilog support.
+# conda-forge has current releases of both; the base image already has conda.
+# Yosys is used only as a PDK-less elaboration gate (synth -top; stat) to catch
+# unsynthesizable RTL early — Verilator accepts constructs yosys rejects.
+RUN conda install -y -c conda-forge "verilator>=5.036" "yosys>=0.68" \
     && conda clean -afy
 
 RUN pip install --no-cache-dir cocotb cocotb-test
