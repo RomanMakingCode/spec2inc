@@ -1,0 +1,41 @@
+# Single-machine CHIA cluster for the Vertex/Gemini smoke test.
+#
+# The LLM worker is deliberately NOT containerized. Application Default
+# Credentials live at ~/.config/gcloud on the host, and google-genai is already
+# in chia_env, so running the LLM node on the host sidesteps mounting
+# credentials into a container entirely. The cocotb/Verilator work stays
+# containerized (examples/smoke_test/cluster.yaml) -- an LLM call and a
+# simulator have no reason to share an image.
+#
+# Before `chia up`:
+#   export THIS_MACHINE=$(hostname -I | awk '{print $1}')
+#   export GOOGLE_CLOUD_PROJECT=<project id>
+
+provider:
+    head_ip: ${THIS_MACHINE}
+
+auth:
+    ssh_user: ${USER}
+
+available_node_types:
+    vertex_worker:
+        # VertexGeminiLLM.prompt requests vertex_creds: 0.01, so one unit
+        # allows 100 concurrent in-flight prompts. The real cap is Vertex-side
+        # quota, not this number.
+        resources: {"vertex_creds": 1}
+        num_workers: 1
+        compatible_ips: ["${THIS_MACHINE}"]
+        worker_env_commands:
+            - "source ~/miniconda3/etc/profile.d/conda.sh && conda activate chia_env && export GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}"
+
+head_env_commands: ["source ~/miniconda3/etc/profile.d/conda.sh && conda activate chia_env"]
+head_setup_commands: ["source ~/miniconda3/etc/profile.d/conda.sh && conda activate chia_env"]
+head_start_ray_commands:
+    - "source ~/miniconda3/etc/profile.d/conda.sh && conda activate chia_env && ray stop"
+    - "source ~/miniconda3/etc/profile.d/conda.sh && conda activate chia_env && \
+        ray start --head --port=6379 \
+        --include-dashboard=True --dashboard-agent-listen-port=0"
+
+worker_start_ray_commands:
+    - "ray stop"
+    - "ray start --address=$RAY_HEAD_IP:6379 --dashboard-agent-listen-port=0"
