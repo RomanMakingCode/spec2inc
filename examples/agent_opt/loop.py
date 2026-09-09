@@ -10,17 +10,30 @@ Correctness is not negotiable and not the agent's to define: the testbench and
 the reference model behind it are outside the agent's reach, so a candidate that
 breaks behavior fails regardless of how much depth it saves.
 
+Results land in git rather than in a scratch directory. The loop branches off
+the current HEAD, edits the real RTL in place, and commits every attempt with
+its measurements in the message. Nothing has to be "adopted" -- the work is
+already versioned, and a run you dislike is a branch you delete. Your original
+branch is restored on the way out, so main is never touched.
+
     export THIS_MACHINE=$(hostname -I | awk '{print $1}')
     export GOOGLE_CLOUD_PROJECT=<project id>
     chia up -y examples/agent_opt/cluster.yaml
-    python examples/agent_opt/loop.py --attempts 4
+    python -u examples/agent_opt/loop.py --attempts 6
     chia down -y examples/agent_opt/cluster.yaml
+
+Afterwards:
+
+    git log --oneline main..agent/reduction_engine-<stamp>   # what it tried
+    git diff main..agent/reduction_engine-<stamp>            # the net change
+    git merge agent/reduction_engine-<stamp>                 # keep it
+    git branch -D agent/reduction_engine-<stamp>             # or don't
 """
 
 import argparse
 import json
 import os
-import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -34,11 +47,12 @@ from nodes import EvalNode, Evaluation                      # noqa: E402
 from tools import RtlEditTool                               # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
-RUNS_DIR = REPO / ".agent_runs"
+TARGET = REPO / "rtl" / "reduction_engine.sv"
+LOGS_DIR = REPO / ".agent_runs"
 
 # The parameter point the agent optimizes for. 16 ports is mid-range: big
 # enough that the chain is clearly worse than a tree, small enough to simulate
-# quickly. Improvements are re-checked at 8 and 64 at the end.
+# quickly. Improvements are re-checked at other points at the end.
 OPT_N_PORTS = 16
 OPT_RED_LATENCY = 3
 VERIFY_POINTS = [(8, 1), (8, 3), (16, 1), (16, 6), (64, 3)]
@@ -83,17 +97,21 @@ the whole pipeline freezes while a completed result waits for `res_ready`.
   or unbounded array types, `initial` blocks, and anything else that only makes
   sense in simulation.
 
-## Why it is currently slow
+## Where the depth actually goes
 
-The reduction is written as a sequential accumulation across all N_PORTS
-operands inside a single `always_comb`. That is a chain of N adders, so logic
-depth grows linearly with N_PORTS. Measured depth is 86 levels at N_PORTS=8,
-111 at 16, and 255 at 64.
+Measured with yosys `ltp` on the current design, logic depth is 86 at
+N_PORTS=8, 111 at 16, and 255 at 64 -- it grows linearly with N_PORTS because
+the reduction is a sequential accumulation across all operands in one
+`always_comb`.
 
-A balanced adder tree would make depth grow with log2(N_PORTS) instead. Note
-that RED_LATENCY registers already exist in the pipeline -- distributing tree
-levels across them is allowed and encouraged, as long as total latency stays
-exactly RED_LATENCY cycles.
+Be aware of the floor: roughly 60 levels of the total is carry propagation
+through a single 32-bit add, which is paid once no matter how the operands are
+combined, and only a few levels come from each additional combining step. So
+restructuring how operands are combined helps a lot, while merely moving those
+combining steps across pipeline registers does not -- the carry chain stays
+wherever the final add lands. Getting below the floor needs the addition itself
+restructured, for example carry-save accumulation with one carry-propagate at
+the end.
 
 ## How you are measured
 
@@ -110,33 +128,77 @@ attributes cleanly.
 """
 
 
-def make_workdir() -> Path:
-    """Copy the RTL and verification sources somewhere the agent can scribble.
+# --------------------------------------------------------------------- git
 
-    The agent never edits the repo's own files: a run that goes badly should
-    leave nothing behind but a directory under .agent_runs/.
+
+def git(*args: str, check: bool = True) -> str:
+    proc = subprocess.run(["git", *args], cwd=REPO,
+                          capture_output=True, text=True)
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed:\n{proc.stderr}")
+    return proc.stdout.strip()
+
+
+def require_clean_tree() -> None:
+    """Refuse to start on a dirty tree.
+
+    The agent edits tracked files in place, so pre-existing uncommitted work
+    would end up mixed into its commits and be impossible to separate later.
     """
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    work = RUNS_DIR / stamp
-    (work / "rtl").mkdir(parents=True, exist_ok=True)
-    (work / "verif" / "reduction_engine").mkdir(parents=True, exist_ok=True)
-
-    for name in ("spec2inc_pkg.sv", "reduction_engine.sv"):
-        shutil.copy2(REPO / "rtl" / name, work / "rtl" / name)
-    shutil.copy2(REPO / "verif" / "reference.py", work / "verif" / "reference.py")
-    for name in ("Makefile", "tb_reduction_engine.py"):
-        shutil.copy2(REPO / "verif" / "reduction_engine" / name,
-                     work / "verif" / "reduction_engine" / name)
-    return work
+    dirty = git("status", "--porcelain")
+    if dirty:
+        raise SystemExit(
+            "working tree has uncommitted changes; commit or stash first:\n"
+            + dirty
+        )
 
 
-def evaluate(ev: EvalNode, work: Path, n_ports: int, red_latency: int) -> Evaluation:
-    test = get(ev.run_tests.chia_remote(ev, str(work), n_ports, red_latency))
+def commit_attempt(attempt: int, ev: Evaluation, accepted: bool,
+                   model: str) -> str:
+    """Commit whatever the agent just wrote, accepted or not.
+
+    Rejected attempts are committed too: the sequence of things that did not
+    work is most of what a run has to say, and dropping it would leave the same
+    evidence gap that scratch directories did.
+    """
+    if not git("status", "--porcelain", "--", str(TARGET)):
+        return ""  # agent changed nothing
+
+    if ev.usable:
+        headline = (f"depth={ev.synth.depth} cells={ev.synth.cells} "
+                    f"({'accepted' if accepted else 'no improvement'})")
+    elif ev.test.passed:
+        headline = "rejected: synthesis failed"
+    else:
+        headline = f"rejected: {ev.test.summary()}"
+
+    body = [
+        f"tests: {ev.test.summary()}",
+        f"point: N_PORTS={ev.n_ports} RED_LATENCY={ev.red_latency}",
+        f"model: {model}",
+    ]
+    if ev.synth is not None:
+        body.append(f"synth: {ev.synth.summary()}")
+
+    git("add", "--", str(TARGET))
+    git("commit", "-m",
+        f"agent(reduction_engine): attempt {attempt} -- {headline}",
+        "-m", "\n".join(body),
+        "-m", "Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>")
+    return git("rev-parse", "--short", "HEAD")
+
+
+# ---------------------------------------------------------------- the loop
+
+
+def evaluate(ev: EvalNode, n_ports: int, red_latency: int) -> Evaluation:
+    test = get(ev.run_tests.chia_remote(ev, str(REPO), n_ports, red_latency))
     synth = None
     if test.passed:
         # Only worth synthesizing something that works.
-        synth = get(ev.run_synth.chia_remote(ev, str(work), n_ports))
-    return Evaluation(n_ports=n_ports, red_latency=red_latency, test=test, synth=synth)
+        synth = get(ev.run_synth.chia_remote(ev, str(REPO), n_ports))
+    return Evaluation(n_ports=n_ports, red_latency=red_latency,
+                      test=test, synth=synth)
 
 
 def format_feedback(attempt: int, ev: Evaluation, best_depth: int) -> str:
@@ -171,64 +233,76 @@ def format_feedback(attempt: int, ev: Evaluation, best_depth: int) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--attempts", type=int, default=4)
+    ap.add_argument("--attempts", type=int, default=6)
     ap.add_argument("--model", default=os.environ.get("GEMINI_MODEL",
                                                       "gemini-3.1-pro-preview"))
     ap.add_argument("--location", default=os.environ.get("GEMINI_LOCATION", "global"))
     ap.add_argument("--max-tokens", type=int, default=64000)
+    ap.add_argument("--branch", default=None,
+                    help="branch to create; default agent/reduction_engine-<stamp>")
     args = ap.parse_args()
 
     project = os.environ.get("GOOGLE_CLOUD_PROJECT")
     if not project:
         raise SystemExit("GOOGLE_CLOUD_PROJECT is not set")
 
-    work = make_workdir()
-    target = work / "rtl" / "reduction_engine.sv"
-    print(f"workdir: {work}")
+    require_clean_tree()
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    branch = args.branch or f"agent/reduction_engine-{stamp}"
+    origin_branch = git("rev-parse", "--abbrev-ref", "HEAD")
+    base_commit = git("rev-parse", "--short", "HEAD")
+
+    logs = LOGS_DIR / stamp
+    logs.mkdir(parents=True, exist_ok=True)
+
+    git("checkout", "-b", branch)
+    print(f"branch {branch} off {origin_branch}@{base_commit}")
 
     ev = EvalNode()
-
-    print("\n=== baseline ===")
-    base = evaluate(ev, work, OPT_N_PORTS, OPT_RED_LATENCY)
-    if not base.usable:
-        raise SystemExit(f"baseline is not usable: {base.test.summary()}")
-    print(f"baseline: {base.test.summary()}, {base.synth.summary()}")
-
-    best_depth = base.synth.depth
-    best_cells = base.synth.cells
-    best_src = target.read_text()
-    history = [{"attempt": 0, "depth": best_depth, "cells": best_cells,
-                "tests": base.test.summary()}]
-
-    llm = VertexGeminiLLM(
-        model=args.model,
-        project=project,
-        location=args.location,
-        system_message=SYSTEM_MESSAGE,
-        max_tool_iterations=12,
-        retries=2,
-        # CHIA defaults to 16000, which truncates here: an attempt has to emit
-        # the entire ~110-line module as a tool argument on top of whatever the
-        # model spends on reasoning, and a Pro model spends a lot.
-        max_tokens=args.max_tokens,
-    )
-    tool = RtlEditTool(name="rtl_edit", target_file=str(target))
-
-    message = TASK.format(n_tests=base.test.tests_run)
+    llm = None
+    tool = None
+    history = []
+    best_depth = best_cells = None
+    best_commit = base_commit
 
     try:
+        print("\n=== baseline ===")
+        base = evaluate(ev, OPT_N_PORTS, OPT_RED_LATENCY)
+        if not base.usable:
+            raise SystemExit(f"baseline is not usable: {base.test.summary()}")
+        print(f"baseline: {base.test.summary()}, {base.synth.summary()}")
+
+        best_depth, best_cells = base.synth.depth, base.synth.cells
+        history.append({"attempt": 0, "depth": best_depth, "cells": best_cells,
+                        "tests": base.test.summary(), "commit": base_commit})
+
+        llm = VertexGeminiLLM(
+            model=args.model,
+            project=project,
+            location=args.location,
+            system_message=SYSTEM_MESSAGE,
+            max_tool_iterations=12,
+            retries=2,
+            # CHIA defaults to 16000, which truncates here: an attempt emits the
+            # whole module as a tool argument on top of the model's reasoning.
+            max_tokens=args.max_tokens,
+        )
+        tool = RtlEditTool(name="rtl_edit", target_file=str(TARGET))
+        message = TASK.format(n_tests=base.test.tests_run)
+
         for attempt in range(1, args.attempts + 1):
             print(f"\n=== attempt {attempt}/{args.attempts} ===")
             started = time.time()
             try:
                 reply = get(llm.prompt.chia_remote(llm, message, [tool]))
             except Exception as exc:
-                # A single bad attempt -- truncation, a transient Vertex error,
-                # one of this host's OAuth stalls -- should cost one iteration,
-                # not the whole run. Tell the agent what happened and continue.
+                # One bad attempt -- truncation, a transient Vertex error, one
+                # of this host's OAuth stalls -- costs one iteration, not the run.
                 print(f"agent call raised {type(exc).__name__}: {str(exc)[:200]}")
                 history.append({"attempt": attempt, "depth": None, "cells": None,
-                                "tests": f"agent error: {type(exc).__name__}"})
+                                "tests": f"agent error: {type(exc).__name__}",
+                                "commit": ""})
                 message = (
                     f"Attempt {attempt} did not complete: {type(exc).__name__}. "
                     "Your previous response was cut off before the edit landed. "
@@ -236,51 +310,63 @@ def main() -> None:
                     "tool call."
                 )
                 continue
+
             print(f"agent responded in {time.time() - started:.0f}s "
                   f"(success={reply.success})")
             if not reply.success:
-                print("agent call failed; continuing to next attempt")
+                print("agent call failed; continuing")
                 continue
 
-            cand = evaluate(ev, work, OPT_N_PORTS, OPT_RED_LATENCY)
-
-            # Snapshot every attempt before anything can overwrite it. Without
-            # this a run that ends without improving leaves no trace of what the
-            # agent actually tried, which is most of what there is to learn.
-            snaps = work / "attempts"
-            snaps.mkdir(exist_ok=True)
-            (snaps / f"attempt_{attempt}.sv").write_text(target.read_text())
-            if not cand.test.passed:
-                (snaps / f"attempt_{attempt}_test.log").write_text(cand.test.log)
-            elif cand.synth is not None and not cand.synth.ok:
-                (snaps / f"attempt_{attempt}_synth.log").write_text(cand.synth.log)
+            cand = evaluate(ev, OPT_N_PORTS, OPT_RED_LATENCY)
+            improved = cand.usable and cand.synth.depth < best_depth
 
             if cand.usable:
-                print(f"  {cand.test.summary()}, {cand.synth.summary()}")
+                print(f"  {cand.test.summary()}, {cand.synth.summary()}"
+                      + ("  <- new best" if improved else ""))
             else:
-                reason = ("tests" if not cand.test.passed else "synthesis")
+                reason = "tests" if not cand.test.passed else "synthesis"
                 print(f"  {cand.test.summary()} -- rejected on {reason}")
+                log = (cand.test.log if not cand.test.passed
+                       else cand.synth.log)
+                (logs / f"attempt_{attempt}_{reason}.log").write_text(log)
+
+            sha = commit_attempt(attempt, cand, improved, args.model)
+            if sha:
+                print(f"  committed {sha}")
 
             history.append({
                 "attempt": attempt,
                 "depth": cand.synth.depth if cand.usable else None,
                 "cells": cand.synth.cells if cand.usable else None,
                 "tests": cand.test.summary(),
+                "commit": sha,
             })
 
-            if cand.usable and cand.synth.depth < best_depth:
-                print(f"  new best: depth {best_depth} -> {cand.synth.depth}")
-                best_depth = cand.synth.depth
-                best_cells = cand.synth.cells
-                best_src = target.read_text()
+            if improved:
+                best_depth, best_cells = cand.synth.depth, cand.synth.cells
+                best_commit = sha
 
             message = format_feedback(attempt, cand, best_depth)
     finally:
-        tool.stop()
+        if tool is not None:
+            tool.stop()
+        # Any straggler edit from a crashed attempt still gets committed, so
+        # checkout below cannot fail on a dirty tree and nothing is lost.
+        if git("status", "--porcelain", "--", str(TARGET)):
+            git("add", "--", str(TARGET))
+            git("commit", "-m", "agent(reduction_engine): uncommitted edit at exit")
 
-    # Restore the best design that actually passed, so the workdir holds the
-    # result rather than whatever the last attempt happened to leave.
-    target.write_text(best_src)
+    # Leave the branch tip at the best design rather than at whatever the last
+    # attempt happened to produce, so `git diff <origin>..<branch>` is the
+    # result and nothing has to be hand-picked out of the history. When no
+    # attempt improved on the baseline this restores the original file, making
+    # the net diff empty while the attempt history survives on the branch.
+    if best_commit != git("rev-parse", "--short", "HEAD"):
+        git("checkout", best_commit, "--", str(TARGET))
+        if git("status", "--porcelain"):
+            git("commit", "-m",
+                f"agent(reduction_engine): restore best design from {best_commit}")
+            print(f"\nrestored best design from {best_commit}")
 
     print("\n=== result ===")
     print(f"depth {history[0]['depth']} -> {best_depth}   "
@@ -290,11 +376,10 @@ def main() -> None:
     if best_depth < history[0]["depth"]:
         print("\nre-checking the winning design at other parameter points:")
         for n_ports, red_latency in VERIFY_POINTS:
-            chk = evaluate(ev, work, n_ports, red_latency)
-            line = (f"  N_PORTS={n_ports} RED_LATENCY={red_latency}: "
-                    f"{chk.test.summary()}"
-                    + (f", {chk.synth.summary()}" if chk.usable else ""))
-            print(line)
+            chk = evaluate(ev, n_ports, red_latency)
+            print(f"  N_PORTS={n_ports} RED_LATENCY={red_latency}: "
+                  f"{chk.test.summary()}"
+                  + (f", {chk.synth.summary()}" if chk.usable else ""))
             verified.append({
                 "n_ports": n_ports, "red_latency": red_latency,
                 "passed": chk.test.passed,
@@ -302,15 +387,19 @@ def main() -> None:
                 "cells": chk.synth.cells if chk.usable else None,
             })
 
-    (work / "summary.json").write_text(json.dumps({
-        "model": args.model,
-        "baseline": history[0],
-        "history": history,
-        "best_depth": best_depth,
-        "best_cells": best_cells,
+    (logs / "summary.json").write_text(json.dumps({
+        "model": args.model, "branch": branch, "base": base_commit,
+        "baseline": history[0], "history": history,
+        "best_depth": best_depth, "best_cells": best_cells,
         "verified": verified,
     }, indent=2))
-    print(f"\nartifacts in {work}")
+
+    git("checkout", origin_branch)
+    print(f"\nback on {origin_branch}; the run is on {branch}")
+    print(f"  git log --oneline {origin_branch}..{branch}")
+    print(f"  git diff {origin_branch}..{branch}")
+    print(f"  git merge {branch}      # keep it")
+    print(f"  git branch -D {branch}  # or don't")
 
 
 if __name__ == "__main__":
