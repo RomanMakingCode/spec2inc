@@ -37,6 +37,11 @@ class TestResult:
     def summary(self) -> str:
         if self.passed:
             return f"all {self.tests_run} tests passed"
+        if self.tests_run == 0:
+            # No summary line means elaboration or the build died before any
+            # test ran. Saying "0 of 0 tests FAILED" reads as nonsense, and this
+            # string is fed back to the agent as its diagnosis.
+            return "DID NOT COMPILE: no tests ran"
         return f"{self.tests_failed} of {self.tests_run} tests FAILED"
 
 

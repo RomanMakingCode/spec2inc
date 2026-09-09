@@ -204,10 +204,16 @@ def evaluate(ev: EvalNode, n_ports: int, red_latency: int) -> Evaluation:
 def format_feedback(attempt: int, ev: Evaluation, best_depth: int) -> str:
     if not ev.test.passed:
         tail = "\n".join(ev.test.log.strip().splitlines()[-60:])
+        diagnosis = (
+            "The module did not compile, so no test ran. Read the compiler "
+            "error below and fix the syntax or elaboration problem."
+            if ev.test.tests_run == 0 else
+            "Your change altered behavior. The testbench is fixed and correct; "
+            "the design is what must change."
+        )
         return (
             f"Attempt {attempt} REJECTED: {ev.test.summary()}.\n\n"
-            "Your change altered behavior or broke the build. The testbench is "
-            "fixed and correct; the design is what must change. Relevant output:\n\n"
+            f"{diagnosis}\n\n"
             f"```\n{tail}\n```\n\n"
             "Fix this. Correctness comes before depth."
         )
