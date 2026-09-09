@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 
 from chia.base.ChiaFunction import ChiaFunction
@@ -115,24 +116,28 @@ class EvalNode:
         cell library.
         """
         rtl = os.path.join(workdir, "rtl")
-        flat = os.path.join(workdir, "flat.v")
 
-        conv = subprocess.run(
-            f"sv2v {rtl}/spec2inc_pkg.sv {rtl}/reduction_engine.sv > {flat}",
-            shell=True, capture_output=True, text=True,
-        )
-        if conv.returncode != 0:
-            return SynthResult(ok=False, cells=0, depth=0,
-                               log="sv2v failed:\n" + conv.stderr)
+        # Intermediate Verilog goes to a temp dir, never into workdir: the loop
+        # now runs against the repo itself, and a stray artifact there would
+        # dirty the tree and block the next run's clean-tree check.
+        with tempfile.TemporaryDirectory(prefix="spec2inc_synth_") as tmp:
+            flat = os.path.join(tmp, "flat.v")
+            conv = subprocess.run(
+                f"sv2v {rtl}/spec2inc_pkg.sv {rtl}/reduction_engine.sv > {flat}",
+                shell=True, capture_output=True, text=True,
+            )
+            if conv.returncode != 0:
+                return SynthResult(ok=False, cells=0, depth=0,
+                                   log="sv2v failed:\n" + conv.stderr)
 
-        script = (
-            f"read_verilog {flat}; "
-            f"chparam -set N_PORTS {n_ports} reduction_engine; "
-            f"synth -top reduction_engine; stat; ltp"
-        )
-        proc = subprocess.run(["yosys", "-p", script],
-                              capture_output=True, text=True)
-        log = proc.stdout + "\n" + proc.stderr
+            script = (
+                f"read_verilog {flat}; "
+                f"chparam -set N_PORTS {n_ports} reduction_engine; "
+                f"synth -top reduction_engine; stat; ltp"
+            )
+            proc = subprocess.run(["yosys", "-p", script],
+                                  capture_output=True, text=True)
+            log = proc.stdout + "\n" + proc.stderr
         if proc.returncode != 0:
             return SynthResult(ok=False, cells=0, depth=0, log=log)
 
