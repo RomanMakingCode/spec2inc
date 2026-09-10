@@ -59,6 +59,7 @@ TARGETS = {
             # unreachable when the table covers the whole index space.
             verify_points=(
                 {"N_PORTS": 8, "GROUP_TABLE_ENTRIES": 16},
+                {"N_PORTS": 32, "GROUP_TABLE_ENTRIES": 4},
                 {"N_PORTS": 64, "GROUP_TABLE_ENTRIES": 64},
             ),
             skeleton="examples/agent_loop/skeletons/group_table.sv",

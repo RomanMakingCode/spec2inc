@@ -33,6 +33,17 @@ MASK_ALL = (1 << MAX_PORTS) - 1
 SETTLE_NS = 1
 
 
+def idx_at(fraction: float) -> int:
+    """An in-range table index, chosen relative to the table's size.
+
+    Tests must not hardcode indices: GROUP_TABLE_ENTRIES is swept, and a
+    literal like 7 silently becomes an out-of-range read on a small table,
+    failing a correct implementation for a reason that has nothing to do with
+    what the test is checking.
+    """
+    return min(int(GROUP_TABLE_ENTRIES * fraction), GROUP_TABLE_ENTRIES - 1)
+
+
 async def start(dut):
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     dut.wr_en.value = 0
@@ -137,17 +148,20 @@ async def reads_are_combinational(dut):
     """
     await start(dut)
 
+    idx_a, idx_b = 0, idx_at(0.75)
+    assert idx_a != idx_b, "table too small to distinguish two indices"
+
     a_members = 0x0000_0000_0000_00FF
     b_members = 0xFF00_0000_0000_0000
-    await write(dut, 3, True, a_members)
-    await write(dut, 7, True, b_members)
+    await write(dut, idx_a, True, a_members)
+    await write(dut, idx_b, True, b_members)
 
     # Both reads happen inside one clock cycle, with no edge between them.
-    dut.rd_idx.value = 3
+    dut.rd_idx.value = idx_a
     await Timer(SETTLE_NS, unit="ns")
     assert as_int(dut.rd_members) == a_members, "first combinational read wrong"
 
-    dut.rd_idx.value = 7
+    dut.rd_idx.value = idx_b
     await Timer(SETTLE_NS, unit="ns")
     assert as_int(dut.rd_members) == b_members, (
         "second read in the same cycle did not follow rd_idx -- read appears registered"
@@ -159,16 +173,17 @@ async def writes_are_synchronous(dut):
     """A write is not visible until the edge that commits it."""
     await start(dut)
 
+    idx = idx_at(0.5)
     old = 0x0000_0000_0000_0F0F
     new = 0x0000_0000_0000_F0F0
-    await write(dut, 5, True, old)
+    await write(dut, idx, True, old)
 
     # Present the new value and read the same index before the clock edge.
     dut.wr_en.value = 1
-    dut.wr_idx.value = 5
+    dut.wr_idx.value = idx
     dut.wr_valid_bit.value = 1
     dut.wr_members.value = new
-    dut.rd_idx.value = 5
+    dut.rd_idx.value = idx
     await Timer(SETTLE_NS, unit="ns")
     assert as_int(dut.rd_members) == old, (
         "write became visible before the clock edge -- storage is not registered"
@@ -178,7 +193,7 @@ async def writes_are_synchronous(dut):
     await FallingEdge(dut.clk)
     dut.wr_en.value = 0
 
-    _, got = await read(dut, 5)
+    _, got = await read(dut, idx)
     assert got == new, "write did not take effect on the clock edge"
 
 
@@ -219,12 +234,13 @@ async def entries_can_be_invalidated(dut):
     """Writing with the valid bit clear makes the entry read invalid."""
     await start(dut)
 
-    await write(dut, 2, True, MASK_ALL)
-    valid, _ = await read(dut, 2)
+    idx = idx_at(0.5)
+    await write(dut, idx, True, MASK_ALL)
+    valid, _ = await read(dut, idx)
     assert valid == 1, "setup write did not take"
 
-    await write(dut, 2, False, MASK_ALL)
-    valid, _ = await read(dut, 2)
+    await write(dut, idx, False, MASK_ALL)
+    valid, _ = await read(dut, idx)
     assert valid == 0, "entry still valid after being written with valid=0"
 
 
