@@ -150,6 +150,11 @@ class Harness:
         self.accepted = defaultdict(int)  # source -> beats accepted
         self.running = True
         self.protocol_errors = []
+        # Cycles where the sink bus could not be read at all. Skipping these
+        # silently would hide both deliveries and protocol violations, so they
+        # are counted and reported rather than ignored.
+        self.blind_cycles = 0
+        self.offered_while_blocked = False
         self._words = [0] * N_SRC
         self._valid = [0] * N_SRC
 
@@ -212,6 +217,7 @@ class Harness:
             ready = as_int(self.dut.m_ready)
             words = as_int(self.dut.m_req)
             if valid is None or ready is None or words is None:
+                self.blind_cycles += 1
                 await RisingEdge(self.dut.clk)
                 continue
             for d in range(N_PORTS):
@@ -251,6 +257,7 @@ class Harness:
                             f"sink {d}: m_req changed while waiting for m_ready")
                         held[d] = word
                 if v and not (ready >> d) & 1:
+                    self.offered_while_blocked = True
                     held.setdefault(d, word)
                 elif v and (ready >> d) & 1:
                     held.pop(d, None)
@@ -335,6 +342,10 @@ def check_packets_not_interleaved(h: Harness):
 
 
 def check_all(h: Harness):
+    assert h.blind_cycles == 0, (
+        f"{h.blind_cycles} cycle(s) where the sink bus read as X/Z, so both "
+        "deliveries and protocol violations went unobserved in them"
+    )
     check_protocol(h)
     check_conservation(h)
     check_flow_order(h)
@@ -352,7 +363,7 @@ async def quiet_after_reset(dut):
     await start(dut)
     for _ in range(5):
         valid = as_int(dut.m_valid)
-        assert valid == 0, f"m_valid={valid:#x} out of reset with no traffic"
+        assert valid == 0, f"m_valid={valid} out of reset with no traffic"
         await RisingEdge(dut.clk)
         await FallingEdge(dut.clk)
 
@@ -418,50 +429,55 @@ async def engine_sources_are_routed(dut):
 
 
 @cocotb.test(timeout_time=TIMEOUT_NS, timeout_unit="ns")
-async def contention_shares_a_sink_fairly(dut):
-    """With every source aimed at one sink, none is left far behind.
+async def a_greedy_source_cannot_starve_another(dut):
+    """A source offering continuously must not lock another out forever.
 
-    Conservation alone would be satisfied by an arbiter that drains source 0
-    completely before looking at source 1. Requiring merely "at least one beat
-    each" is too weak to catch a 90/10 split, so this checks that by the time
-    half the traffic is through, no source is more than one beat from its fair
-    share.
+    This is the spec's actual requirement -- no source starved indefinitely --
+    and deliberately not a share-of-bandwidth test. Demanding equal shares
+    would reject legitimate policies the spec permits, such as a hierarchical
+    arbiter that round-robins the unicast ports as a group against the two
+    engines. What is not permitted is a victim never finishing.
+
+    Progress is measured at the sink, not at source acceptance: an input skid
+    buffer lets a crossbar accept from every source immediately and still
+    drain only one of them, which a source-side count would score as fair.
     """
     await start(dut)
     h = Harness(dut, random.Random(9))
     spawn(h)
 
-    per_source = 6
-    queues = {
-        s: [Beat(s, 0, s, (s + 1) * 1000 + i, 1, i) for i in range(per_source)]
-        for s in range(N_SRC)
-    }
-    drivers = [cocotb.start_soon(h.source(s, queues[s])) for s in range(N_SRC)]
+    victim, greedy = 1, 0
+    victim_beats = [Beat(victim, 0, 0x5A, 0x7000 + i, 1, i) for i in range(4)]
 
-    total = per_source * N_SRC
-    for _ in range(3000):
+    async def greedy_forever():
+        i = 0
+        while h.running:
+            await h.source(greedy, [Beat(greedy, 0, 0x0B, 0x9000 + i, 1, 0)])
+            i += 1
+
+    cocotb.start_soon(greedy_forever())
+    await RisingEdge(dut.clk)
+
+    delivered = cocotb.start_soon(h.source(victim, victim_beats))
+    for _ in range(1500):
+        if delivered.done():
+            break
         await RisingEdge(dut.clk)
         await FallingEdge(dut.clk)
-        if sum(h.accepted.values()) >= total // 2:
-            break
-    midpoint = {s: h.accepted.get(s, 0) for s in range(N_SRC)}
-    moved = sum(midpoint.values())
 
-    for d in drivers:
-        await d
+    assert delivered.done(), (
+        f"source {victim} never got its {len(victim_beats)} beats through "
+        f"while source {greedy} offered continuously -- it is starved"
+    )
+
     await h.drain()
-
-    assert moved >= total // 2, (
-        f"only {moved} of {total} beats moved before the sample -- the fabric "
-        "stalled rather than arbitrating"
+    from_victim = [b for b in h.seen[0]
+                   if b["src"] == victim and b["tag"] == 0x5A]
+    assert len(from_victim) == len(victim_beats), (
+        f"{len(from_victim)} of {len(victim_beats)} victim beats reached the "
+        "sink, so acceptance was not delivery"
     )
-    fair = moved / N_SRC
-    laggards = {s: n for s, n in midpoint.items() if n < fair - 1}
-    assert not laggards, (
-        f"unfair arbitration: fair share was {fair:.1f} beats each, but "
-        f"{laggards} got less. Full distribution: {midpoint}"
-    )
-    check_all(h)
+    check_protocol(h)
 
 
 @cocotb.test(timeout_time=TIMEOUT_NS, timeout_unit="ns")
@@ -477,6 +493,9 @@ async def backpressured_sink_blocks_only_itself(dut):
 
     blocked, open_sink = 0, N_PORTS - 1
     assert blocked != open_sink, "needs at least two sinks"
+    # Written at the start of a cycle, matching the harness convention, so it
+    # cannot race the monitors sampling mid-cycle.
+    await RisingEdge(dut.clk)
     dut.m_ready.value = ((1 << N_PORTS) - 1) & ~(1 << blocked)
 
     to_blocked = [Beat(0, blocked, 1, 0xA000 + i, int(i == 2), i)
@@ -494,12 +513,22 @@ async def backpressured_sink_blocks_only_itself(dut):
     assert not h.seen[blocked], (
         f"{len(h.seen[blocked])} beat(s) delivered to a sink holding m_ready low"
     )
+    # The beat must still be *offered* to the stalled sink. Without this, a
+    # design computing m_valid[d] = have_beat && m_ready[d] passes every other
+    # test: it simply never enters the offered-but-not-accepted state, so the
+    # protocol monitor never sees anything to complain about. That gating is
+    # also exactly the valid-depends-on-ready direction channel rule 4 forbids.
+    assert h.offered_while_blocked, (
+        "nothing was ever offered to the backpressured sink: m_valid never "
+        "rose while m_ready was low, so valid is gated by ready"
+    )
     assert len(h.seen[open_sink]) == len(to_open), (
         f"a backpressured sink stalled an unrelated one: "
         f"{len(h.seen[open_sink])} of {len(to_open)} arrived"
     )
 
-    # Release, and confirm the held traffic was queued rather than discarded.
+    # Release at the start of a cycle, again to avoid racing the monitors.
+    await RisingEdge(dut.clk)
     dut.m_ready.value = (1 << N_PORTS) - 1
     await h.drain()
 
@@ -523,11 +552,13 @@ async def sink_ready_toggling_preserves_traffic(dut):
     h = Harness(dut, rng)
     spawn(h)
 
+    stop_chaos = []
+
     async def chaos():
         # Change m_ready just after a rising edge so it is stable through the
         # falling-edge sample and the next rising edge. Driving it at the
         # falling edge races the monitors reading it in that same timestep.
-        while h.running:
+        while h.running and not stop_chaos:
             await RisingEdge(dut.clk)
             dut.m_ready.value = rng.getrandbits(N_PORTS)
             await FallingEdge(dut.clk)
@@ -540,10 +571,78 @@ async def sink_ready_toggling_preserves_traffic(dut):
               for s in range(N_SRC)]:
         await d
 
-    # Open everything so the tail drains, then settle.
-    h.running = False
+    # Stop the chaos generator and let it observe the flag before opening
+    # every sink, otherwise it keeps randomising m_ready through the drain and
+    # the tail finishes under roughly half ready -- a flake that surfaces as a
+    # beat having "never arrived".
+    stop_chaos.append(True)
+    await RisingEdge(dut.clk)
+    await FallingEdge(dut.clk)
     dut.m_ready.value = (1 << N_PORTS) - 1
-    h.running = True
     await h.drain()
 
     check_all(h)
+
+
+@cocotb.test(timeout_time=TIMEOUT_NS, timeout_unit="ns")
+async def reset_mid_traffic_clears_the_fabric(dut):
+    """Reset asserted with beats in flight silences the fabric and recovers.
+
+    `quiet_after_reset` on its own proves very little: verilator is two-state,
+    so unreset registers read zero and a design that never connects rst_n
+    passes it. Asserting reset while transfers are actually in progress is what
+    distinguishes a fabric that flushes from one that carries stale state
+    across the reset and keeps delivering it afterwards.
+    """
+    await start(dut)
+    rng = random.Random(31)
+    h = Harness(dut, rng)
+    spawn(h)
+
+    # Get several sources genuinely busy, aimed at one sink so beats queue.
+    for s_idx in range(min(4, N_SRC)):
+        cocotb.start_soon(h.source(
+            s_idx, [Beat(s_idx, 0, 0x33, 0xC000 + s_idx * 16 + i, int(i == 2), i)
+                    for i in range(3)]))
+    for _ in range(6):
+        await RisingEdge(dut.clk)
+        await FallingEdge(dut.clk)
+
+    h.running = False          # stop the monitors before the state disappears
+    await RisingEdge(dut.clk)
+
+    dut.rst_n.value = 0
+    dut.s_valid.value = 0
+    for _ in range(4):
+        await RisingEdge(dut.clk)
+        await FallingEdge(dut.clk)
+        valid = as_int(dut.m_valid)
+        assert valid == 0, (
+            f"m_valid={valid} while rst_n is low -- the fabric kept offering "
+            "beats through reset"
+        )
+
+    await RisingEdge(dut.clk)
+    dut.rst_n.value = 1
+    await RisingEdge(dut.clk)
+    await FallingEdge(dut.clk)
+
+    # And it still works afterwards, with none of the pre-reset traffic
+    # reappearing.
+    h2 = Harness(dut, rng)
+    spawn(h2)
+    await h2.source(0, [Beat(0, 1, 0x44, 0xD000 + i, int(i == 1), i)
+                        for i in range(2)])
+    await h2.drain(40)
+
+    check_all(h2)
+    assert len(h2.seen[1]) == 2, (
+        f"the fabric did not recover after reset: {len(h2.seen[1])} of 2 "
+        "post-reset beats arrived"
+    )
+    stale = [b for beats in h2.seen.values() for b in beats
+             if b["tag"] == 0x33]
+    assert not stale, (
+        f"{len(stale)} pre-reset beat(s) were delivered after reset -- "
+        "in-flight state survived it"
+    )
