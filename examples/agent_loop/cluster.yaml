@@ -41,7 +41,7 @@ available_node_types:
         compatible_ips: ["${THIS_MACHINE}"]
         docker:
             image: "spec2inc-cocotb-verilator:latest"
-            container_name: "chia-agentopt-${USER}"
+            container_name: "chia-agentloop-${USER}"
             pull_before_run: false
             run_options:
                 - -v /home/roman/spec2inc:/home/roman/spec2inc

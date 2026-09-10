@@ -90,6 +90,16 @@ async def reset_clears_every_entry(dut):
     for idx in range(GROUP_TABLE_ENTRIES):
         await write(dut, idx, True, MASK_ALL)
 
+    # Confirm the fill actually took before resetting. Without this the test
+    # is satisfied by an implementation that never sets a valid bit at all --
+    # "nothing is valid after reset" being vacuously true.
+    for idx in (0, GROUP_TABLE_ENTRIES - 1):
+        valid, _ = await read(dut, idx)
+        assert valid == 1, (
+            f"entry {idx} never became valid, so this test cannot say "
+            "anything about reset"
+        )
+
     dut.rst_n.value = 0
     await RisingEdge(dut.clk)
     await FallingEdge(dut.clk)

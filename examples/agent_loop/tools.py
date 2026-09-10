@@ -1,9 +1,9 @@
 """ChiaTools exposed to the design agent.
 
 The agent is given exactly one capability: read and rewrite the body of the RTL
-module under optimization. It cannot run tests, cannot read or edit the
-testbench, the reference model, or the frozen type package, and cannot reach any
-other file.
+module it is working on. It cannot run tests, cannot read or edit any
+testbench, the reference model, or the frozen type package, and cannot reach
+any other file.
 
 That scoping is the trust model from docs/modules.md 5, made mechanical. An
 agent that could run its own evaluation could report a result that never
@@ -20,15 +20,16 @@ from chia.base.tools.ChiaTool import ChiaTool
 class RtlEditTool(ChiaTool):
     """Read/write access to a single RTL file, and nothing else."""
 
-    def setup(self, target_file: str):
+    def setup(self, target_file: str, module_name: str):
         self.target_file = Path(target_file)
+        self.module_name = module_name
         if not self.target_file.is_file():
             raise FileNotFoundError(f"no such RTL file: {self.target_file}")
         self.mcp.add_tool(self.read_rtl, name=f"{self.name}_read_rtl")
         self.mcp.add_tool(self.write_rtl, name=f"{self.name}_write_rtl")
 
     def read_rtl(self) -> str:
-        """Return the full current text of the SystemVerilog module being optimized."""
+        """Return the full current text of the SystemVerilog module being worked on."""
         return self.target_file.read_text()
 
     def write_rtl(self, content: str) -> str:
@@ -38,8 +39,11 @@ class RtlEditTool(ChiaTool):
         list and parameters must stay exactly as they are -- the surrounding
         design and its testbench are compiled against them.
         """
-        if "module reduction_engine" not in content:
-            return "REJECTED: content does not define module reduction_engine"
+        # Cheap structural guard. Not a correctness check -- that is the
+        # testbench's job -- just enough that a truncated or empty response is
+        # rejected here rather than surfacing later as a confusing build error.
+        if f"module {self.module_name}" not in content:
+            return f"REJECTED: content does not define module {self.module_name}"
         if "endmodule" not in content:
             return "REJECTED: content has no endmodule"
 
