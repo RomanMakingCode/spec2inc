@@ -34,20 +34,20 @@ module group_table
         if (!rst_n) begin
             valid_array <= '0;
         end else begin
-            if (wr_en && (wr_idx < GROUP_TABLE_ENTRIES)) begin
+            if (wr_en && (int'(wr_idx) < GROUP_TABLE_ENTRIES)) begin
                 valid_array[wr_idx] <= wr_valid_bit;
             end
         end
     end
 
     always_ff @(posedge clk) begin
-        if (wr_en && (wr_idx < GROUP_TABLE_ENTRIES)) begin
+        if (wr_en && (int'(wr_idx) < GROUP_TABLE_ENTRIES)) begin
             mem_array[wr_idx] <= wr_members;
         end
     end
 
     always_comb begin
-        if (rd_idx < GROUP_TABLE_ENTRIES) begin
+        if (int'(rd_idx) < GROUP_TABLE_ENTRIES) begin
             rd_valid_bit = valid_array[rd_idx];
             rd_members   = mem_array[rd_idx];
         end else begin
