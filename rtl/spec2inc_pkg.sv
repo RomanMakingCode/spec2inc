@@ -100,6 +100,14 @@ package spec2inc_pkg;
 
     localparam int BLOCK_DESC_W = $bits(block_desc_t);   // 168, fits one beat
 
+    // Flattened transaction widths, for ports that carry an array of
+    // transactions. A crossbar's source and sink ports are arrays by nature,
+    // and a flat vector keeps their layout unambiguous to verilator, sv2v and
+    // the cocotb testbenches alike: element i occupies [i*REQ_W +: REQ_W].
+    // Derived rather than written out, so they cannot drift from the structs.
+    localparam int REQ_W = $bits(req_t);   // 344
+    localparam int RSP_W = $bits(rsp_t);   // 281
+
     // Written by the block engine to status_off exactly once per collective,
     // after all its member writes have been acknowledged. The requesting
     // endpoint learns of completion by polling this; it is never told directly.

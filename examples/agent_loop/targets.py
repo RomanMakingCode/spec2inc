@@ -49,6 +49,18 @@ TARGETS = {
             ),
         ),
         Target(
+            name="req_xbar",
+            rtl="rtl/req_xbar.sv",
+            tb_dir="verif/req_xbar",
+            task="examples/agent_loop/tasks/req_xbar.md",
+            # 8 ports keeps the scoreboard's traffic tractable while still
+            # having enough sources to contend for a sink.
+            params={"N_PORTS": 8},
+            objective="correctness",
+            verify_points=({"N_PORTS": 4}, {"N_PORTS": 16}),
+            skeleton="examples/agent_loop/skeletons/req_xbar.sv",
+        ),
+        Target(
             name="group_table",
             rtl="rtl/group_table.sv",
             tb_dir="verif/group_table",
