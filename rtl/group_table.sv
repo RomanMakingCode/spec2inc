@@ -1,9 +1,12 @@
 // group_table -- per-port group membership storage. Spec: docs/modules.md 3.2.
 //
-// INTERFACE ONLY. The body is deliberately absent: this is the starting point
-// handed to the design agent in an implement-from-spec run, so that the port
-// list is fixed by the loop rather than invented by the agent. It compiles and
-// fails every test.
+// One instance lives inside each port_ingress, holding the accelerator bitmask
+// for every group that port can address. Reads are combinational because
+// port_ingress resolves a request's group in the cycle it classifies it;
+// writes are synchronous, preloaded by privileged software in the real system.
+//
+// The index space is ID_W bits wide while the table may be narrower, so an
+// index is range-checked at full width and narrowed only to address the array.
 
 module group_table
     import spec2inc_pkg::*;

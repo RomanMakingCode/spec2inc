@@ -4,6 +4,9 @@
 // handed to the design agent in an implement-from-spec run, so that the port
 // list is fixed by the loop rather than invented by the agent. It compiles and
 // fails every test.
+//
+// REPLACE THIS HEADER when implementing: describing the finished module as an
+// empty interface is worse than no comment at all.
 
 module group_table
     import spec2inc_pkg::*;

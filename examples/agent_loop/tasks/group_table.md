@@ -52,3 +52,7 @@ the whole goal.
 
 Call the read tool to see the current file, then the write tool with the
 complete new file.
+
+Replace the file's header comment as part of implementing it. The one there now
+describes an empty interface, and leaving it in place would make the finished
+module misdescribe itself.
