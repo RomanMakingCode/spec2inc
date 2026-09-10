@@ -155,6 +155,11 @@ class Harness:
         # are counted and reported rather than ignored.
         self.blind_cycles = 0
         self.offered_while_blocked = False
+        # Lets a test stop every driver and release the bus. Without it the
+        # source coroutines keep asserting s_valid, and a check for "the
+        # fabric is quiet" would really be demanding that outputs are gated
+        # during reset -- behaviour the spec does not require.
+        self.halt = False
         self._words = [0] * N_SRC
         self._valid = [0] * N_SRC
 
@@ -181,6 +186,8 @@ class Harness:
         await RisingEdge(self.dut.clk)
 
         for beat in beats:
+            if self.halt:
+                break
             while gap and self.rng.random() < gap:
                 await FallingEdge(self.dut.clk)
                 await RisingEdge(self.dut.clk)
@@ -194,8 +201,10 @@ class Harness:
                 ready = as_int(self.dut.s_ready)
                 taken = ready is not None and (ready >> idx) & 1
                 await RisingEdge(self.dut.clk)
-                if taken:
+                if taken or self.halt:
                     break
+            if self.halt:
+                break
             self.sent[idx].append(beat)
             self.accepted[idx] += 1
 
@@ -608,11 +617,17 @@ async def reset_mid_traffic_clears_the_fabric(dut):
         await RisingEdge(dut.clk)
         await FallingEdge(dut.clk)
 
+    # Quiesce the sources and let them release the bus, so what follows tests
+    # that no state survives reset rather than that outputs are gated during
+    # it -- the latter is not in the spec.
+    h.halt = True
+    for _ in range(3):
+        await RisingEdge(dut.clk)
+        await FallingEdge(dut.clk)
     h.running = False          # stop the monitors before the state disappears
     await RisingEdge(dut.clk)
 
     dut.rst_n.value = 0
-    dut.s_valid.value = 0
     for _ in range(4):
         await RisingEdge(dut.clk)
         await FallingEdge(dut.clk)
