@@ -49,7 +49,9 @@ _FIELDS = (("op", OP_W), ("src", ID_W), ("dst", ID_W), ("tag", TAG_W),
 _COMPARED = [name for name, _ in _FIELDS]
 
 CLK_NS = 10
-TIMEOUT = f"{CLK_NS * 4000}ns"
+# cocotb wants a number plus a unit; a string here raises inside the
+# scheduler before any test runs.
+TIMEOUT_NS = CLK_NS * 4000
 
 
 def pack(**kw) -> int:
@@ -329,7 +331,7 @@ def spawn(h: Harness):
     cocotb.start_soon(h.protocol())
 
 
-@cocotb.test(timeout_time=TIMEOUT, timeout_unit="step")
+@cocotb.test(timeout_time=TIMEOUT_NS, timeout_unit="ns")
 async def quiet_after_reset(dut):
     """Out of reset nothing is offered and nothing is accepted."""
     await start(dut)
@@ -340,7 +342,7 @@ async def quiet_after_reset(dut):
         await FallingEdge(dut.clk)
 
 
-@cocotb.test(timeout_time=TIMEOUT, timeout_unit="step")
+@cocotb.test(timeout_time=TIMEOUT_NS, timeout_unit="ns")
 async def single_source_single_sink(dut):
     """The simplest path works before anything harder is asked of it."""
     await start(dut)
@@ -354,7 +356,7 @@ async def single_source_single_sink(dut):
     check_all(h)
 
 
-@cocotb.test(timeout_time=TIMEOUT, timeout_unit="step")
+@cocotb.test(timeout_time=TIMEOUT_NS, timeout_unit="ns")
 async def all_sources_to_all_sinks(dut):
     """Random traffic from every source, including both engine ports."""
     await start(dut)
@@ -372,7 +374,7 @@ async def all_sources_to_all_sinks(dut):
     check_all(h)
 
 
-@cocotb.test(timeout_time=TIMEOUT, timeout_unit="step")
+@cocotb.test(timeout_time=TIMEOUT_NS, timeout_unit="ns")
 async def engine_sources_are_routed(dut):
     """The primitive and block engine ports are ordinary sources.
 
@@ -400,7 +402,7 @@ async def engine_sources_are_routed(dut):
     assert len(h.seen[0]) == 2, "block engine traffic did not arrive"
 
 
-@cocotb.test(timeout_time=TIMEOUT, timeout_unit="step")
+@cocotb.test(timeout_time=TIMEOUT_NS, timeout_unit="ns")
 async def contention_shares_a_sink_fairly(dut):
     """With every source aimed at one sink, none is left far behind.
 
@@ -447,7 +449,7 @@ async def contention_shares_a_sink_fairly(dut):
     check_all(h)
 
 
-@cocotb.test(timeout_time=TIMEOUT, timeout_unit="step")
+@cocotb.test(timeout_time=TIMEOUT_NS, timeout_unit="ns")
 async def backpressured_sink_blocks_only_itself(dut):
     """A sink holding m_ready low accepts nothing and loses nothing.
 
@@ -493,7 +495,7 @@ async def backpressured_sink_blocks_only_itself(dut):
     check_all(h)
 
 
-@cocotb.test(timeout_time=TIMEOUT, timeout_unit="step")
+@cocotb.test(timeout_time=TIMEOUT_NS, timeout_unit="ns")
 async def sink_ready_toggling_preserves_traffic(dut):
     """Randomly toggling every sink's m_ready loses and corrupts nothing.
 
