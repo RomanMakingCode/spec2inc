@@ -102,6 +102,27 @@ def evaluate(ev: EvalNode, target: Target, params: dict) -> Evaluation:
     return Evaluation(params=params, test=test, synth=synth)
 
 
+def check_verify_points(ev_node: EvalNode, target: Target):
+    """Evaluate the secondary parameter points, stopping at the first failure.
+
+    Run inside the attempt loop rather than once at the end. A module that
+    works at one parameter point and does not build at another is not finished,
+    and the agent can only fix what it is told about -- reporting it after the
+    loop has already declared success wastes the attempt that would have fixed
+    it.
+
+    Only called once the primary point passes, so the cost lands on candidates
+    that have earned it.
+    """
+    results = []
+    for params in target.verify_points:
+        chk = evaluate(ev_node, target, dict(params))
+        results.append(chk)
+        if not chk.usable:
+            return results, chk
+    return results, None
+
+
 def score(target: Target, ev: Evaluation):
     """Lower is better. None when the candidate is not usable at all."""
     if not ev.usable:
@@ -114,7 +135,25 @@ def score(target: Target, ev: Evaluation):
 
 
 def format_feedback(target: Target, attempt: int, ev: Evaluation,
-                    best) -> str:
+                    best, verify_fail: Evaluation = None) -> str:
+    if verify_fail is not None:
+        failing = verify_fail
+        tail = "\n".join(
+            (failing.test.log if not failing.test.passed
+             else failing.synth.log).strip().splitlines()[-60:]
+        )
+        return (
+            f"Attempt {attempt} REJECTED: it works at {ev.params} but "
+            f"{'does not build' if failing.test.tests_run == 0 else 'fails'} "
+            f"at {failing.params}.\n\n"
+            "The module must be correct across its whole parameter range, not "
+            "just at one point. Note that the index space and the table size "
+            "are set by different parameters, so one can be wider than the "
+            "other.\n\n"
+            f"```\n{tail}\n```\n\n"
+            "Fix this without breaking the point that already works."
+        )
+
     if not ev.test.passed:
         tail = "\n".join(ev.test.log.strip().splitlines()[-60:])
         diagnosis = (
@@ -190,6 +229,7 @@ def main() -> None:
     ev = EvalNode()
     tool = None
     history = []
+    verified = []
     best = None
     best_commit = base_commit
 
@@ -258,16 +298,39 @@ def main() -> None:
                 continue
 
             cand = evaluate(ev, target, target.params)
-            now = score(target, cand)
-            improved = now is not None and (best is None or now < best)
+            print(f"  {cand.describe()}")
 
-            print(f"  {cand.describe()}" + ("  <- new best" if improved else ""))
+            verify_fail = None
+            if cand.usable:
+                verified_now, verify_fail = check_verify_points(ev, target)
+                for chk in verified_now:
+                    print(f"    {chk.describe()}")
+                if verify_fail is None and verified_now:
+                    verified = [
+                        {"params": v.params, "passed": v.test.passed,
+                         "cells": v.synth.cells if v.usable else None,
+                         "depth": v.synth.depth if v.usable else None}
+                        for v in verified_now
+                    ]
+
+            complete = cand.usable and verify_fail is None
+            now = score(target, cand) if complete else None
+            improved = now is not None and (best is None or now < best)
+            if improved:
+                print("    <- new best")
+
             if not cand.usable:
                 reason = "tests" if not cand.test.passed else "synthesis"
                 log = cand.test.log if not cand.test.passed else cand.synth.log
                 (logs / f"attempt_{attempt}_{reason}.log").write_text(log)
+            elif verify_fail is not None:
+                log = (verify_fail.test.log if not verify_fail.test.passed
+                       else verify_fail.synth.log)
+                (logs / f"attempt_{attempt}_verify.log").write_text(log)
 
-            if cand.usable:
+            if cand.usable and verify_fail is not None:
+                headline = (f"rejected: fails at {verify_fail.params}")
+            elif cand.usable:
                 headline = (f"{cand.synth.summary()} "
                             f"({'accepted' if improved else 'no improvement'})")
             elif cand.test.passed:
@@ -295,11 +358,11 @@ def main() -> None:
 
             # In implement mode the goal is binary: once it passes and
             # synthesizes there is nothing further to ask for.
-            if mode == "implement" and cand.usable:
-                print("  module is correct and synthesizes; stopping")
+            if mode == "implement" and complete:
+                print("  correct and synthesizing at every parameter point; stopping")
                 break
 
-            message = format_feedback(target, attempt, cand, best)
+            message = format_feedback(target, attempt, cand, best, verify_fail)
     finally:
         if tool is not None:
             tool.stop()
@@ -327,15 +390,13 @@ def main() -> None:
         print(f"{target.name}: {target.objective} "
               f"{history[0]['score']} -> {best}")
 
-    verified = []
-    if best is not None and target.verify_points:
-        print("\nre-checking at other parameter points:")
-        for params in target.verify_points:
-            chk = evaluate(ev, target, dict(params))
-            print(f"  {chk.describe()}")
-            verified.append({"params": params, "passed": chk.test.passed,
-                             "cells": chk.synth.cells if chk.usable else None,
-                             "depth": chk.synth.depth if chk.usable else None})
+    if verified:
+        print("\nverified at:")
+        for v in verified:
+            print(f"  {v['params']}: "
+                  + ("ok" if v["passed"] else "FAILED")
+                  + (f", cells={v['cells']} depth={v['depth']}"
+                     if v["cells"] is not None else ""))
 
     (logs / "summary.json").write_text(json.dumps({
         "target": target.name, "mode": mode, "model": args.model,
