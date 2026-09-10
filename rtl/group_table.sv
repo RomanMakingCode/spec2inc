@@ -27,6 +27,19 @@ module group_table
     output port_mask_t      rd_members
 );
 
+    localparam int AW = $clog2(GROUP_TABLE_ENTRIES);
+    localparam int IDX_W = (AW > 0) ? AW : 1;
+    
+    typedef logic [IDX_W-1:0] idx_t;
+
+    idx_t w_addr;
+    idx_t r_addr;
+
+    // Explicit cast silences Verilator WIDTHTRUNC warnings when ID_W > IDX_W
+    // (e.g. 6-bit wr_idx indexing a 16-entry array, which needs 4 bits)
+    assign w_addr = idx_t'(wr_idx);
+    assign r_addr = idx_t'(rd_idx);
+
     logic [GROUP_TABLE_ENTRIES-1:0] valid_array;
     port_mask_t mem_array [GROUP_TABLE_ENTRIES];
 
@@ -35,21 +48,21 @@ module group_table
             valid_array <= '0;
         end else begin
             if (wr_en && (int'(wr_idx) < GROUP_TABLE_ENTRIES)) begin
-                valid_array[wr_idx] <= wr_valid_bit;
+                valid_array[w_addr] <= wr_valid_bit;
             end
         end
     end
 
     always_ff @(posedge clk) begin
         if (wr_en && (int'(wr_idx) < GROUP_TABLE_ENTRIES)) begin
-            mem_array[wr_idx] <= wr_members;
+            mem_array[w_addr] <= wr_members;
         end
     end
 
     always_comb begin
         if (int'(rd_idx) < GROUP_TABLE_ENTRIES) begin
-            rd_valid_bit = valid_array[rd_idx];
-            rd_members   = mem_array[rd_idx];
+            rd_valid_bit = valid_array[r_addr];
+            rd_members   = mem_array[r_addr];
         end else begin
             rd_valid_bit = 1'b0;
             rd_members   = '0;
