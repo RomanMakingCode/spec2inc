@@ -167,10 +167,18 @@ class Harness:
         would transfer, so the beat is recorded as sent in the same cycle the
         DUT takes it.
         """
+        # Align to just after a rising edge. Everything below keeps that
+        # phase, so a beat is always presented at the start of a cycle and the
+        # first s_ready sample belongs to that same cycle. Presenting
+        # mid-cycle and then awaiting the *next* falling edge would skip the
+        # cycle the DUT may already have accepted in, leaving the accepted
+        # word on the bus to be delivered a second time.
+        await RisingEdge(self.dut.clk)
+
         for beat in beats:
             while gap and self.rng.random() < gap:
-                await RisingEdge(self.dut.clk)
                 await FallingEdge(self.dut.clk)
+                await RisingEdge(self.dut.clk)
 
             self._words[idx] = beat.word()
             self._valid[idx] = 1
@@ -516,9 +524,12 @@ async def sink_ready_toggling_preserves_traffic(dut):
     spawn(h)
 
     async def chaos():
+        # Change m_ready just after a rising edge so it is stable through the
+        # falling-edge sample and the next rising edge. Driving it at the
+        # falling edge races the monitors reading it in that same timestep.
         while h.running:
-            dut.m_ready.value = rng.getrandbits(N_PORTS)
             await RisingEdge(dut.clk)
+            dut.m_ready.value = rng.getrandbits(N_PORTS)
             await FallingEdge(dut.clk)
         dut.m_ready.value = (1 << N_PORTS) - 1
 
