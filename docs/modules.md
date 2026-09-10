@@ -178,9 +178,17 @@ unambiguous to verilator, sv2v, and the cocotb testbench alike.
 | `rd_members` | out | `logic [MAX_PORTS-1:0]` | |
 
 **Contract.**
+- **Reads are combinational**: `rd_valid_bit` and `rd_members` reflect the entry selected by
+  `rd_idx` in the same cycle, with no register in between. `port_ingress` classifies a request
+  and resolves its group in one cycle (§6.1), so a registered read would not fit.
+- **Writes are synchronous**, taking effect on the clock edge where `wr_en` is high. A read of
+  the same index in that cycle still returns the old entry; the new one appears the cycle after.
 - Read-after-write returns the written entry.
 - Entries are independent; writing one never disturbs another.
-- Reset clears all valid bits.
+- An `rd_idx` at or beyond `GROUP_TABLE_ENTRIES` reads as invalid — `rd_valid_bit` low,
+  `rd_members` zero — rather than aliasing onto a real entry.
+- Reset clears all valid bits. It need not clear `rd_members`, since a clear valid bit already
+  means the entry carries nothing.
 - Storage is an explicit register array, never an associative array — required for the Yosys
   elaboration gate.
 
