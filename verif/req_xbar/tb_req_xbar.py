@@ -186,6 +186,13 @@ class Harness:
             self.sent[idx].append(beat)
             self.accepted[idx] += 1
 
+            # Drop valid the instant the beat is taken. Leaving the accepted
+            # word on the bus during the idle gap below would re-offer it, and
+            # a correct DUT would dutifully deliver it again -- reported as the
+            # DUT duplicating beats when the testbench sent them twice.
+            self._valid[idx] = 0
+            self._drive()
+
         self._valid[idx] = 0
         self._drive()
 
