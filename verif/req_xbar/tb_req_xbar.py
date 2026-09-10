@@ -2,18 +2,22 @@
 
 The oracle is conservation, not computation: this module moves beats without
 changing them, so what has to be checked is that every beat injected at a
-source arrives once at the sink its dst names, in the order its flow sent it,
-without being duplicated, dropped, misrouted, or interleaved with another
-packet at the same sink.
+source arrives once at the sink its dst names, unaltered, in the order its flow
+sent it, without being duplicated, dropped, misrouted, or interleaved with
+another packet at the same sink.
 
-Structure: one driver coroutine per source, one monitor coroutine per sink, and
-a scoreboard comparing what went in against what came out. Every beat carries a
-unique marker in its data field so a duplicate or a swap is unambiguous rather
-than inferred.
+Structure: one driver coroutine per source, one monitor coroutine per sink, a
+protocol checker watching the sink channels continuously, and a scoreboard
+comparing what went in against what came out. Every beat carries a unique
+marker so a duplicate or a swap is unambiguous rather than inferred.
 
-Timing convention: drivers present a beat and hold it until the cycle where
-valid and ready are both high; monitors sample at the same instant. Both look at
-the settled mid-cycle value, never at an edge.
+Timing convention. A transfer happens at the rising edge where valid and ready
+are both high, so both must be sampled in the cycle *before* that edge -- that
+is, at the falling edge preceding it. Sampling after the rising edge reads the
+next cycle's handshake and silently misattributes transfers.
+
+Every test carries a timeout. Without one a DUT that never asserts ready hangs
+the driver loop forever, and a hang is far less useful than a failure.
 """
 
 import os
@@ -34,10 +38,18 @@ BLOCK_SRC = N_PORTS + 1     # the block engine's source index
 OP_W, ID_W, TAG_W, ADDR_W, LEN_W, DATA_W = 3, 6, 8, 48, 16, 256
 REQ_W = OP_W + 2 * ID_W + TAG_W + ADDR_W + LEN_W + DATA_W + 1   # 344
 
-REQ_READ, REQ_WRITE = 0, 1
+REQ_READ, REQ_WRITE, REQ_READ_REDUCE, REQ_WRITE_MCAST, REQ_BLOCK_INVOKE = range(5)
 
 _FIELDS = (("op", OP_W), ("src", ID_W), ("dst", ID_W), ("tag", TAG_W),
            ("addr", ADDR_W), ("len", LEN_W), ("data", DATA_W), ("last", 1))
+
+# Every field is compared on arrival. Checking only the routing fields would
+# let a crossbar zero op/addr/len, or force last=1 on every beat -- and forcing
+# last would additionally make the non-interleaving check vacuous.
+_COMPARED = [name for name, _ in _FIELDS]
+
+CLK_NS = 10
+TIMEOUT = f"{CLK_NS * 4000}ns"
 
 
 def pack(**kw) -> int:
@@ -67,38 +79,52 @@ def as_int(signal):
 class Beat:
     """One injected beat, and where it is expected to land."""
 
-    __slots__ = ("src", "dst", "tag", "marker", "last", "seq")
+    __slots__ = ("fields",)
 
-    def __init__(self, src, dst, tag, marker, last, seq):
-        self.src, self.dst, self.tag = src, dst, tag
-        self.marker, self.last, self.seq = marker, last, seq
+    def __init__(self, src, dst, tag, marker, last, seq, op=REQ_WRITE):
+        self.fields = dict(op=op, src=src, dst=dst, tag=tag, addr=seq,
+                           len=1, data=marker, last=last)
+
+    def __getattr__(self, name):
+        try:
+            return self.fields[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    @property
+    def marker(self):
+        return self.fields["data"]
 
     def word(self) -> int:
-        return pack(op=REQ_WRITE, src=self.src, dst=self.dst, tag=self.tag,
-                    addr=self.seq, len=1, data=self.marker, last=self.last)
+        return pack(**self.fields)
 
     def __repr__(self):
-        return (f"Beat(src={self.src} dst={self.dst} tag={self.tag} "
-                f"marker={self.marker:#x} last={self.last})")
+        f = self.fields
+        return (f"Beat(src={f['src']} dst={f['dst']} tag={f['tag']} "
+                f"op={f['op']} marker={f['data']:#x} last={f['last']})")
 
 
 def make_packets(rng, n_packets, srcs, dsts, max_beats=3):
     """Build per-source beat queues. Marker values are globally unique."""
+    ops = [REQ_READ, REQ_WRITE, REQ_READ_REDUCE, REQ_WRITE_MCAST,
+           REQ_BLOCK_INVOKE]
     queues = defaultdict(list)
     marker = 1
     for _ in range(n_packets):
         src = rng.choice(srcs)
         dst = rng.choice(dsts)
         tag = rng.randrange(1 << TAG_W)
+        op = rng.choice(ops)   # the fabric routes every opcode identically
         n_beats = rng.randint(1, max_beats)
         for i in range(n_beats):
             queues[src].append(
-                Beat(src, dst, tag, marker, int(i == n_beats - 1), i))
+                Beat(src, dst, tag, marker, int(i == n_beats - 1), i, op=op))
             marker += 1
     return queues
 
 
-async def reset(dut):
+async def start(dut):
+    cocotb.start_soon(Clock(dut.clk, CLK_NS, unit="ns").start())
     dut.s_valid.value = 0
     dut.s_req.value = 0
     dut.m_ready.value = (1 << N_PORTS) - 1
@@ -111,11 +137,6 @@ async def reset(dut):
     await FallingEdge(dut.clk)
 
 
-async def start(dut):
-    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
-    await reset(dut)
-
-
 class Harness:
     """Drives every source, monitors every sink, and records what happened."""
 
@@ -126,39 +147,45 @@ class Harness:
         self.sent = defaultdict(list)     # source -> [Beat]
         self.accepted = defaultdict(int)  # source -> beats accepted
         self.running = True
-        self._src_words = [0] * N_SRC
-        self._src_valid = [0] * N_SRC
+        self.protocol_errors = []
+        self._words = [0] * N_SRC
+        self._valid = [0] * N_SRC
 
-    def _drive_bus(self):
+    def _drive(self):
         packed = 0
         for s in range(N_SRC):
-            packed |= self._src_words[s] << (s * REQ_W)
+            packed |= self._words[s] << (s * REQ_W)
         self.dut.s_req.value = packed
-        self.dut.s_valid.value = sum(v << s for s, v in enumerate(self._src_valid))
+        self.dut.s_valid.value = sum(v << s for s, v in enumerate(self._valid))
 
     async def source(self, idx, beats, gap=0.0):
-        """Present each beat until it is accepted, then move to the next."""
+        """Present each beat, holding it until the cycle it is accepted in.
+
+        s_ready is sampled at the falling edge *before* the rising edge that
+        would transfer, so the beat is recorded as sent in the same cycle the
+        DUT takes it.
+        """
         for beat in beats:
-            # Optional idle gaps, so arbitration is exercised with sources that
-            # are not all permanently ready.
             while gap and self.rng.random() < gap:
                 await RisingEdge(self.dut.clk)
                 await FallingEdge(self.dut.clk)
 
-            self._src_words[idx] = beat.word()
-            self._src_valid[idx] = 1
-            self._drive_bus()
+            self._words[idx] = beat.word()
+            self._valid[idx] = 1
+            self._drive()
+
             while True:
-                await RisingEdge(self.dut.clk)
                 await FallingEdge(self.dut.clk)
                 ready = as_int(self.dut.s_ready)
-                if ready is not None and (ready >> idx) & 1:
+                taken = ready is not None and (ready >> idx) & 1
+                await RisingEdge(self.dut.clk)
+                if taken:
                     break
-                self._drive_bus()
             self.sent[idx].append(beat)
             self.accepted[idx] += 1
-            self._src_valid[idx] = 0
-            self._drive_bus()
+
+        self._valid[idx] = 0
+        self._drive()
 
     async def sinks(self):
         """Record every beat that transfers on any sink."""
@@ -168,11 +195,56 @@ class Harness:
             ready = as_int(self.dut.m_ready)
             words = as_int(self.dut.m_req)
             if valid is None or ready is None or words is None:
+                await RisingEdge(self.dut.clk)
                 continue
             for d in range(N_PORTS):
                 if (valid >> d) & 1 and (ready >> d) & 1:
-                    beat = unpack((words >> (d * REQ_W)) & ((1 << REQ_W) - 1))
-                    self.seen[d].append(beat)
+                    self.seen[d].append(
+                        unpack((words >> (d * REQ_W)) & ((1 << REQ_W) - 1)))
+            await RisingEdge(self.dut.clk)
+
+    async def protocol(self):
+        """Channel rules 2 and 3, watched continuously on every sink.
+
+        A beat offered on a sink must stay offered, unchanged, until it is
+        taken. Without this a design that re-arbitrates every cycle -- swapping
+        the beat out from under a sink that has not accepted it yet -- passes
+        every conservation check, because the swapped-out beat is simply
+        delivered later.
+        """
+        held = {}
+        while self.running:
+            await FallingEdge(self.dut.clk)
+            valid = as_int(self.dut.m_valid)
+            ready = as_int(self.dut.m_ready)
+            words = as_int(self.dut.m_req)
+            if valid is None or ready is None or words is None:
+                await RisingEdge(self.dut.clk)
+                continue
+            for d in range(N_PORTS):
+                v = (valid >> d) & 1
+                word = (words >> (d * REQ_W)) & ((1 << REQ_W) - 1)
+                if d in held:
+                    if not v:
+                        self.protocol_errors.append(
+                            f"sink {d}: m_valid dropped before m_ready")
+                        del held[d]
+                    elif word != held[d]:
+                        self.protocol_errors.append(
+                            f"sink {d}: m_req changed while waiting for m_ready")
+                        held[d] = word
+                if v and not (ready >> d) & 1:
+                    held.setdefault(d, word)
+                elif v and (ready >> d) & 1:
+                    held.pop(d, None)
+            await RisingEdge(self.dut.clk)
+
+    async def drain(self, cycles=80):
+        for _ in range(cycles):
+            await RisingEdge(self.dut.clk)
+            await FallingEdge(self.dut.clk)
+        self.running = False
+        await RisingEdge(self.dut.clk)
 
     def all_sent(self):
         return [b for beats in self.sent.values() for b in beats]
@@ -181,33 +253,38 @@ class Harness:
         return [b for beats in self.seen.values() for b in beats]
 
 
+def check_protocol(h: Harness):
+    assert not h.protocol_errors, (
+        f"{len(h.protocol_errors)} channel-protocol violation(s), e.g. "
+        f"{h.protocol_errors[0]}"
+    )
+
+
 def check_conservation(h: Harness):
-    """Every injected beat arrives once, at the sink its dst named."""
+    """Every injected beat arrives once, unaltered, at the sink dst named."""
     sent = {b.marker: b for b in h.all_sent()}
     seen_markers = [b["data"] for b in h.all_seen()]
 
     assert len(seen_markers) == len(set(seen_markers)), (
-        "a beat was duplicated: "
-        f"{len(seen_markers)} delivered, {len(set(seen_markers))} distinct"
+        f"a beat was duplicated: {len(seen_markers)} delivered, "
+        f"{len(set(seen_markers))} distinct"
     )
-
     missing = set(sent) - set(seen_markers)
     assert not missing, (
         f"{len(missing)} beat(s) never arrived, e.g. {sent[sorted(missing)[0]]}"
     )
-
     invented = set(seen_markers) - set(sent)
     assert not invented, f"{len(invented)} beat(s) arrived that were never sent"
 
     for dst, beats in h.seen.items():
         for got in beats:
             want = sent[got["data"]]
-            assert dst == want.dst, (
-                f"misrouted: {want} was delivered to sink {dst}"
-            )
-            assert got["src"] == want.src and got["tag"] == want.tag, (
-                f"beat corrupted in flight: sent {want}, got {got}"
-            )
+            assert dst == want.dst, f"misrouted: {want} delivered to sink {dst}"
+            for field in _COMPARED:
+                assert got[field] == want.fields[field], (
+                    f"{want}: field '{field}' changed in flight -- "
+                    f"got {got[field]}, sent {want.fields[field]}"
+                )
 
 
 def check_flow_order(h: Harness):
@@ -226,12 +303,7 @@ def check_flow_order(h: Harness):
 
 
 def check_packets_not_interleaved(h: Harness):
-    """At one sink, a multi-beat packet is contiguous.
-
-    A packet is the run of beats from one source under one tag ending with
-    last=1. Another source's beats appearing inside that run would leave the
-    egress unable to tell the two transfers apart.
-    """
+    """At one sink, a multi-beat packet is contiguous."""
     sent = {b.marker: b for b in h.all_sent()}
     for dst, beats in h.seen.items():
         open_src = None
@@ -245,50 +317,62 @@ def check_packets_not_interleaved(h: Harness):
             open_src = None if got["last"] else src
 
 
-@cocotb.test()
-async def single_source_single_sink(dut):
-    """The simplest path works before anything harder is asked of it."""
-    await start(dut)
-    rng = random.Random(1)
-    h = Harness(dut, rng)
-    cocotb.start_soon(h.sinks())
-
-    beats = [Beat(0, 0, 7, m, int(m == 4), m) for m in range(1, 5)]
-    await h.source(0, beats)
-    for _ in range(20):
-        await RisingEdge(dut.clk)
-        await FallingEdge(dut.clk)
-    h.running = False
-
-    check_conservation(h)
-    check_flow_order(h)
-
-
-@cocotb.test()
-async def all_sources_to_all_sinks(dut):
-    """Random traffic from every source, including both engine ports."""
-    await start(dut)
-    rng = random.Random(0xC0FFEE)
-    h = Harness(dut, rng)
-    cocotb.start_soon(h.sinks())
-
-    queues = make_packets(rng, n_packets=6 * N_SRC,
-                          srcs=list(range(N_SRC)), dsts=list(range(N_PORTS)))
-    drivers = [cocotb.start_soon(h.source(s, queues[s], gap=0.3))
-               for s in range(N_SRC)]
-    for d in drivers:
-        await d
-    for _ in range(60):
-        await RisingEdge(dut.clk)
-        await FallingEdge(dut.clk)
-    h.running = False
-
+def check_all(h: Harness):
+    check_protocol(h)
     check_conservation(h)
     check_flow_order(h)
     check_packets_not_interleaved(h)
 
 
-@cocotb.test()
+def spawn(h: Harness):
+    cocotb.start_soon(h.sinks())
+    cocotb.start_soon(h.protocol())
+
+
+@cocotb.test(timeout_time=TIMEOUT, timeout_unit="step")
+async def quiet_after_reset(dut):
+    """Out of reset nothing is offered and nothing is accepted."""
+    await start(dut)
+    for _ in range(5):
+        valid = as_int(dut.m_valid)
+        assert valid == 0, f"m_valid={valid:#x} out of reset with no traffic"
+        await RisingEdge(dut.clk)
+        await FallingEdge(dut.clk)
+
+
+@cocotb.test(timeout_time=TIMEOUT, timeout_unit="step")
+async def single_source_single_sink(dut):
+    """The simplest path works before anything harder is asked of it."""
+    await start(dut)
+    h = Harness(dut, random.Random(1))
+    spawn(h)
+
+    beats = [Beat(0, 0, 7, m, int(m == 4), m) for m in range(1, 5)]
+    await h.source(0, beats)
+    await h.drain(30)
+
+    check_all(h)
+
+
+@cocotb.test(timeout_time=TIMEOUT, timeout_unit="step")
+async def all_sources_to_all_sinks(dut):
+    """Random traffic from every source, including both engine ports."""
+    await start(dut)
+    rng = random.Random(0xC0FFEE)
+    h = Harness(dut, rng)
+    spawn(h)
+
+    queues = make_packets(rng, n_packets=6 * N_SRC,
+                          srcs=list(range(N_SRC)), dsts=list(range(N_PORTS)))
+    for d in [cocotb.start_soon(h.source(s, queues[s], gap=0.3))
+              for s in range(N_SRC)]:
+        await d
+    await h.drain()
+
+    check_all(h)
+
+
+@cocotb.test(timeout_time=TIMEOUT, timeout_unit="step")
 async def engine_sources_are_routed(dut):
     """The primitive and block engine ports are ordinary sources.
 
@@ -296,9 +380,8 @@ async def engine_sources_are_routed(dut):
     streams, which is exactly the kind of off-by-one worth checking explicitly.
     """
     await start(dut)
-    rng = random.Random(5)
-    h = Harness(dut, rng)
-    cocotb.start_soon(h.sinks())
+    h = Harness(dut, random.Random(5))
+    spawn(h)
 
     last_sink = N_PORTS - 1
     prim = [Beat(PRIM_SRC, last_sink, 0x11, 0x1000 + i, int(i == 1), i)
@@ -310,63 +393,61 @@ async def engine_sources_are_routed(dut):
     d1 = cocotb.start_soon(h.source(BLOCK_SRC, blk))
     await d0
     await d1
-    for _ in range(30):
-        await RisingEdge(dut.clk)
-        await FallingEdge(dut.clk)
-    h.running = False
+    await h.drain(40)
 
-    check_conservation(h)
+    check_all(h)
     assert len(h.seen[last_sink]) == 2, "primitive engine traffic did not arrive"
     assert len(h.seen[0]) == 2, "block engine traffic did not arrive"
 
 
-@cocotb.test()
-async def contention_starves_no_source(dut):
-    """With every source aimed at one sink, all of them make progress.
+@cocotb.test(timeout_time=TIMEOUT, timeout_unit="step")
+async def contention_shares_a_sink_fairly(dut):
+    """With every source aimed at one sink, none is left far behind.
 
     Conservation alone would be satisfied by an arbiter that drains source 0
-    completely before looking at source 1, which is a livelock waiting to
-    happen once the engines share the fabric with port traffic.
+    completely before looking at source 1. Requiring merely "at least one beat
+    each" is too weak to catch a 90/10 split, so this checks that by the time
+    half the traffic is through, no source is more than one beat from its fair
+    share.
     """
     await start(dut)
-    rng = random.Random(9)
-    h = Harness(dut, rng)
-    cocotb.start_soon(h.sinks())
+    h = Harness(dut, random.Random(9))
+    spawn(h)
 
-    per_source = 4
+    per_source = 6
     queues = {
         s: [Beat(s, 0, s, (s + 1) * 1000 + i, 1, i) for i in range(per_source)]
         for s in range(N_SRC)
     }
     drivers = [cocotb.start_soon(h.source(s, queues[s])) for s in range(N_SRC)]
 
-    # Sample progress partway through: by the time half the total traffic has
-    # been accepted, every source should have moved at least one beat.
     total = per_source * N_SRC
-    for _ in range(2000):
+    for _ in range(3000):
         await RisingEdge(dut.clk)
         await FallingEdge(dut.clk)
         if sum(h.accepted.values()) >= total // 2:
             break
-    midpoint = dict(h.accepted)
+    midpoint = {s: h.accepted.get(s, 0) for s in range(N_SRC)}
+    moved = sum(midpoint.values())
 
     for d in drivers:
         await d
-    for _ in range(60):
-        await RisingEdge(dut.clk)
-        await FallingEdge(dut.clk)
-    h.running = False
+    await h.drain()
 
-    starved = [s for s in range(N_SRC) if midpoint.get(s, 0) == 0]
-    assert not starved, (
-        f"sources {starved} had moved nothing once half the traffic was "
-        f"through: {midpoint}"
+    assert moved >= total // 2, (
+        f"only {moved} of {total} beats moved before the sample -- the fabric "
+        "stalled rather than arbitrating"
     )
-    check_conservation(h)
-    check_flow_order(h)
+    fair = moved / N_SRC
+    laggards = {s: n for s, n in midpoint.items() if n < fair - 1}
+    assert not laggards, (
+        f"unfair arbitration: fair share was {fair:.1f} beats each, but "
+        f"{laggards} got less. Full distribution: {midpoint}"
+    )
+    check_all(h)
 
 
-@cocotb.test()
+@cocotb.test(timeout_time=TIMEOUT, timeout_unit="step")
 async def backpressured_sink_blocks_only_itself(dut):
     """A sink holding m_ready low accepts nothing and loses nothing.
 
@@ -374,15 +455,15 @@ async def backpressured_sink_blocks_only_itself(dut):
     whole fabric would let a slow endpoint halt every other collective.
     """
     await start(dut)
-    rng = random.Random(13)
-    h = Harness(dut, rng)
-    cocotb.start_soon(h.sinks())
+    h = Harness(dut, random.Random(13))
+    spawn(h)
 
     blocked, open_sink = 0, N_PORTS - 1
     assert blocked != open_sink, "needs at least two sinks"
     dut.m_ready.value = ((1 << N_PORTS) - 1) & ~(1 << blocked)
 
-    to_blocked = [Beat(0, blocked, 1, 0xA000 + i, 1, i) for i in range(2)]
+    to_blocked = [Beat(0, blocked, 1, 0xA000 + i, int(i == 2), i)
+                  for i in range(3)]
     to_open = [Beat(1, open_sink, 2, 0xB000 + i, 1, i) for i in range(4)]
 
     d_open = cocotb.start_soon(h.source(1, to_open))
@@ -403,9 +484,46 @@ async def backpressured_sink_blocks_only_itself(dut):
 
     # Release, and confirm the held traffic was queued rather than discarded.
     dut.m_ready.value = (1 << N_PORTS) - 1
-    for _ in range(60):
-        await RisingEdge(dut.clk)
-        await FallingEdge(dut.clk)
-    h.running = False
+    await h.drain()
 
-    assert h.seen[blocked], "traffic to the blocked sink was dropped, not held"
+    assert len(h.seen[blocked]) == len(to_blocked), (
+        f"held traffic was dropped: {len(h.seen[blocked])} of "
+        f"{len(to_blocked)} arrived after m_ready was released"
+    )
+    check_all(h)
+
+
+@cocotb.test(timeout_time=TIMEOUT, timeout_unit="step")
+async def sink_ready_toggling_preserves_traffic(dut):
+    """Randomly toggling every sink's m_ready loses and corrupts nothing.
+
+    This is what exercises channel rule 3 in anger: a design that re-arbitrates
+    while a sink is mid-handshake changes the offered beat, which the protocol
+    monitor sees even when the beat is eventually delivered anyway.
+    """
+    await start(dut)
+    rng = random.Random(21)
+    h = Harness(dut, rng)
+    spawn(h)
+
+    async def chaos():
+        while h.running:
+            dut.m_ready.value = rng.getrandbits(N_PORTS)
+            await RisingEdge(dut.clk)
+            await FallingEdge(dut.clk)
+        dut.m_ready.value = (1 << N_PORTS) - 1
+
+    cocotb.start_soon(chaos())
+    queues = make_packets(rng, n_packets=4 * N_SRC,
+                          srcs=list(range(N_SRC)), dsts=list(range(N_PORTS)))
+    for d in [cocotb.start_soon(h.source(s, queues[s], gap=0.2))
+              for s in range(N_SRC)]:
+        await d
+
+    # Open everything so the tail drains, then settle.
+    h.running = False
+    dut.m_ready.value = (1 << N_PORTS) - 1
+    h.running = True
+    await h.drain()
+
+    check_all(h)

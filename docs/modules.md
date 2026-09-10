@@ -114,8 +114,16 @@ wherever a channel appears:
 1. Transfer occurs on `valid && ready`.
 2. Once `valid` is asserted it must remain asserted until transfer completes.
 3. Payload must be stable while `valid && !ready`.
-4. **`ready` must not combinationally depend on `valid` of the same channel** — this prevents
-   combinational loops closing through the crossbars.
+4. **`valid` must not combinationally depend on `ready` of the same channel.** A source decides
+   to offer a beat on its own; it may not wait to see whether the sink will take it.
+
+   The reverse direction is allowed and unavoidable: `ready` routinely depends on `valid`, since
+   a crossbar cannot grant a sink without knowing who is asking for it. Requiring independence
+   in both directions would make arbitration impossible to write.
+
+   Breaking exactly one direction is what keeps a combinational loop from closing around the
+   fabric, and this is the direction to break — it is also the AXI convention, so it will not
+   surprise anyone reading the RTL.
 5. Multi-beat transfers from one source to one destination must not interleave with another
    transfer on the same channel.
 
