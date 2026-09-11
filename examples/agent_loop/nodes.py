@@ -24,6 +24,14 @@ from chia.base.ChiaFunction import ChiaFunction
 # them reports failures that did not happen.
 _SUMMARY_RE = re.compile(r"TESTS=(\d+)\s+PASS=(\d+)\s+FAIL=(\d+)\s+SKIP=(\d+)")
 
+# Wall-clock ceilings. Every external command gets one: a node that never
+# returns does not just lose an attempt, it deadlocks the Ray task and with it
+# the whole loop, and the loop cannot report a failure it never receives.
+# Generous enough that a slow verilator build at N_PORTS=64 finishes normally.
+BUILD_TIMEOUT_S = 900
+CLEAN_TIMEOUT_S = 120
+SYNTH_TIMEOUT_S = 900
+
 _CELLS_RE = re.compile(r"^\s+(\d+)\s+cells\s*$", re.MULTILINE)
 _LTP_RE = re.compile(r"Longest topological path in \w+ \(length=(\d+)\)")
 
@@ -103,10 +111,24 @@ class EvalNode:
         env = {**os.environ, **{k: str(v) for k, v in params.items()}}
         make_args = [f"{k}={v}" for k, v in sorted(params.items())]
 
-        subprocess.run(["make", "clean"], cwd=test_dir, env=env,
-                       capture_output=True, text=True)
-        proc = subprocess.run(["make", *make_args], cwd=test_dir, env=env,
-                              capture_output=True, text=True)
+        try:
+            subprocess.run(["make", "clean"], cwd=test_dir, env=env,
+                           capture_output=True, text=True,
+                           timeout=CLEAN_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            pass   # a stuck clean is not itself interesting; the build will say
+
+        try:
+            proc = subprocess.run(["make", *make_args], cwd=test_dir, env=env,
+                                  capture_output=True, text=True,
+                                  timeout=BUILD_TIMEOUT_S)
+        except subprocess.TimeoutExpired as exc:
+            partial = (exc.stdout or "") + "\n" + (exc.stderr or "")
+            return TestResult(
+                passed=False, tests_run=0, tests_failed=0,
+                log=(f"TIMED OUT after {BUILD_TIMEOUT_S}s -- the build or the "
+                     f"simulation never finished.\n\n{partial}"),
+            )
         log = proc.stdout + "\n" + proc.stderr
 
         match = _SUMMARY_RE.search(log)
@@ -137,8 +159,13 @@ class EvalNode:
         # the tree and block the next run's clean-tree check.
         with tempfile.TemporaryDirectory(prefix="spec2inc_synth_") as tmp:
             flat = os.path.join(tmp, "flat.v")
-            conv = subprocess.run(f"sv2v {srcs} > {flat}", shell=True,
-                                  capture_output=True, text=True)
+            try:
+                conv = subprocess.run(f"sv2v {srcs} > {flat}", shell=True,
+                                      capture_output=True, text=True,
+                                      timeout=SYNTH_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                return SynthResult(ok=False, cells=0, depth=0,
+                                   log=f"sv2v timed out after {SYNTH_TIMEOUT_S}s")
             if conv.returncode != 0:
                 return SynthResult(ok=False, cells=0, depth=0,
                                    log="sv2v failed:\n" + conv.stderr)
@@ -147,8 +174,14 @@ class EvalNode:
                               for k, v in sorted(params.items()))
             script = (f"read_verilog {flat}; {chparam}"
                       f"synth -top {top}; stat; ltp")
-            proc = subprocess.run(["yosys", "-p", script],
-                                  capture_output=True, text=True)
+            try:
+                proc = subprocess.run(["yosys", "-p", script],
+                                      capture_output=True, text=True,
+                                      timeout=SYNTH_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                return SynthResult(
+                    ok=False, cells=0, depth=0,
+                    log=f"yosys timed out after {SYNTH_TIMEOUT_S}s")
             log = proc.stdout + "\n" + proc.stderr
 
         if proc.returncode != 0:
